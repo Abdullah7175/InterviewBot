@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Mvc.RazorPages;
 using Microsoft.AspNetCore.Mvc.Rendering;
 using Microsoft.EntityFrameworkCore;
 using System.ComponentModel.DataAnnotations;
+using System.Security.Claims;
 
 namespace InterviewBot.Pages.SubTopics
 {
@@ -57,11 +58,13 @@ namespace InterviewBot.Pages.SubTopics
                     return Page();
                 }
 
-                // Create new subtopic with only the necessary properties
+                // Get the current user's ID
+                var userId = int.Parse(User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)!.Value);
                 var newSubTopic = new SubTopic
                 {
                     Title = SubTopic.Title,
-                    TopicId = SubTopic.TopicId
+                    TopicId = SubTopic.TopicId,
+                    UserId = userId
                 };
 
                 _db.SubTopics.Add(newSubTopic);

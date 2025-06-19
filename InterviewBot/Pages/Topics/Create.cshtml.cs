@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 using Microsoft.EntityFrameworkCore;
 using System.ComponentModel.DataAnnotations;
+using System.Security.Claims;
 
 namespace InterviewBot.Pages.Topics
 {
@@ -36,9 +37,11 @@ namespace InterviewBot.Pages.Topics
 
             try
             {
+                var userId = int.Parse(User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)!.Value);
                 var newTopic = new Topic
                 {
-                    Title = Topic.Title
+                    Title = Topic.Title,
+                    UserId = userId
                 };
 
                 _db.Topics.Add(newTopic);

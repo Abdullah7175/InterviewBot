@@ -14,7 +14,8 @@ namespace InterviewBot.Pages.SubTopics
 
         public async Task OnGetAsync()
         {
-            SubTopics = await _db.SubTopics.Include(st => st.Topic).ToListAsync();
+            var userId = int.Parse(User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)!.Value);
+            SubTopics = await _db.SubTopics.Include(st => st.Topic).Where(st => st.UserId == userId).ToListAsync();
         }
     }
 }

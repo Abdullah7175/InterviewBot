@@ -13,5 +13,7 @@ namespace InterviewBot.Models
         public int TopicId { get; set; }
         public Topic Topic { get; set; } = null!;
         public List<InterviewSession> InterviewSessions { get; set; } = new();
+        public int UserId { get; set; }
+        public User User { get; set; } = null!;
     }
 }

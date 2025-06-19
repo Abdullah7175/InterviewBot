@@ -3,6 +3,8 @@ using InterviewBot.Models;
 using InterviewBot.Data;
 using InterviewBot.Services;
 using System.Collections.Concurrent;
+using System.Security.Claims;
+using Microsoft.EntityFrameworkCore;
 
 public class InterviewQuestionTracker
 {
@@ -75,6 +77,22 @@ public class ChatHub : Hub
                 return;
             }
 
+            // Get the current user's ID from claims
+            var userIdClaim = Context.User?.FindFirst(ClaimTypes.NameIdentifier);
+            if (userIdClaim == null || !int.TryParse(userIdClaim.Value, out int userId))
+            {
+                await Clients.Caller.SendAsync("ReceiveMessage", "System", "User not authenticated");
+                return;
+            }
+
+            // Get user details to populate session
+            var user = await _db.Users.FindAsync(userId);
+            if (user == null)
+            {
+                await Clients.Caller.SendAsync("ReceiveMessage", "System", "User not found");
+                return;
+            }
+
             var session = new InterviewSession
             {
                 SubTopicId = subTopicId,
@@ -82,7 +100,13 @@ public class ChatHub : Hub
                 Summary = string.Empty,
                 Messages = new List<ChatMessage>(),
                 CurrentQuestionNumber = 0,
-                IsCompleted = false
+                IsCompleted = false,
+                UserId = userId,
+                // Populate user details
+                CandidateName = user.FullName,
+                CandidateEmail = user.Email,
+                CandidateEducation = user.Education ?? "Not specified",
+                CandidateExperience = user.Experience ?? "0"
             };
 
             _db.InterviewSessions.Add(session);
@@ -92,7 +116,7 @@ public class ChatHub : Hub
             await InitializeQuestionTracker(session);
 
             await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer",
-                "Welcome to your mock interview! Let's start with some basic information. What is your full name?");
+                "Hello! Welcome to your mock interview. Say hello to begin.");
         }
         catch (Exception ex)
         {
@@ -135,29 +159,16 @@ public class ChatHub : Hub
             Timestamp = DateTime.UtcNow
         });
 
-        // Handle flow
-        if (string.IsNullOrEmpty(session.CandidateName))
+        // If this is the first message (greeting), bot greets and asks first question
+        if (session.CurrentQuestionNumber == 0)
         {
-            session.CandidateName = answer;
-            await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer", "Thank you. What is your email address?");
-        }
-        else if (string.IsNullOrEmpty(session.CandidateEmail))
-        {
-            session.CandidateEmail = answer;
-            await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer", "What is your highest education level?");
-        }
-        else if (string.IsNullOrEmpty(session.CandidateEducation))
-        {
-            session.CandidateEducation = answer;
-            await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer", "How many years of experience do you have?");
-        }
-        else if (string.IsNullOrEmpty(session.CandidateExperience))
-        {
-            session.CandidateExperience = answer;
-            await _db.SaveChangesAsync();
+            await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer", "Nice to meet you! Let's begin the interview.");
             await AskNextQuestion(session);
+            return;
         }
-        else if (session.CurrentQuestionNumber < 10)
+
+        // Otherwise, continue with next question or complete
+        if (session.CurrentQuestionNumber < 10)
         {
             await _db.SaveChangesAsync();
             await AskNextQuestion(session);
@@ -185,31 +196,97 @@ public class ChatHub : Hub
 
         try
         {
-            // Mark session as completed
-            session.IsCompleted = true;
-            session.EndTime = DateTime.UtcNow;
+            Console.WriteLine($"Completing interview for session {session.Id}");
+            Console.WriteLine($"In-memory session has {session.Messages.Count} messages");
+            
+            // First, ensure all messages from the in-memory session are saved to database
+            foreach (var message in session.Messages)
+            {
+                if (message.Id == 0) // New message not yet saved
+                {
+                    _db.ChatMessages.Add(message);
+                }
+            }
             await _db.SaveChangesAsync();
+            
+            // Mark session as completed using raw SQL to avoid tracking issues
+            await _db.Database.ExecuteSqlRawAsync(
+                "UPDATE \"InterviewSessions\" SET \"IsCompleted\" = true, \"EndTime\" = {0} WHERE \"Id\" = {1}",
+                DateTime.UtcNow, session.Id);
+
+            // Get the updated session with messages
+            var dbSession = await _db.InterviewSessions
+                .Include(s => s.Messages)
+                .Include(s => s.SubTopic)
+                .FirstOrDefaultAsync(s => s.Id == session.Id);
+
+            if (dbSession == null)
+            {
+                await Clients.Caller.SendAsync("ReceiveMessage", "System", "Session not found in database.");
+                return;
+            }
+
+            Console.WriteLine($"Retrieved session from database. Messages count: {dbSession.Messages.Count}");
 
             // Generate evaluation
-            var evaluationPrompt = $"Evaluate this interview for {session.CandidateName} about {session.SubTopic.Title}.\n";
-            evaluationPrompt += $"Candidate has {session.CandidateEducation} education and {session.CandidateExperience} years experience.\n";
+            var evaluationPrompt = $"Evaluate this interview for {dbSession.CandidateName} about {dbSession.SubTopic.Title}.\n";
+            evaluationPrompt += $"Candidate has {dbSession.CandidateEducation} education and {dbSession.CandidateExperience} years experience.\n";
             evaluationPrompt += "Questions and answers:\n";
 
-            var qaPairs = session.Messages
-                .Where(m => !m.IsUserMessage)
-                .Select(q => new {
-                    Question = q.Content,
-                    Answer = session.Messages
-                        .FirstOrDefault(a => a.IsUserMessage && a.Timestamp > q.Timestamp)?.Content
-                        ?? "No answer provided"
-                });
+            // Properly extract Q&A pairs by pairing questions with their answers
+            var messages = dbSession.Messages.OrderBy(m => m.Timestamp).ToList();
+            var qaPairs = new List<(string Question, string Answer)>();
 
-            foreach (var pair in qaPairs)
+            Console.WriteLine($"Total messages in session: {messages.Count}");
+            
+            for (int i = 0; i < messages.Count; i++)
             {
-                evaluationPrompt += $"Q: {pair.Question}\nA: {pair.Answer}\n\n";
+                var message = messages[i];
+                Console.WriteLine($"Message {i}: IsUser={message.IsUserMessage}, Content='{message.Content}'");
+                
+                if (!message.IsUserMessage) // This is a bot message
+                {
+                    Console.WriteLine($"Processing bot message: '{message.Content}'");
+                    
+                    // Only consider messages that are actual questions (contain "Question" or start with a number)
+                    if (message.Content.Contains("Question") || 
+                        (message.Content.Contains("/10:") || message.Content.Contains("/10 :")))
+                    {
+                        Console.WriteLine($"This is a question message: '{message.Content}'");
+                        
+                        // Find the next user message (answer) after this question
+                        var answer = messages.Skip(i + 1)
+                            .FirstOrDefault(m => m.IsUserMessage)?.Content ?? "No answer provided";
+                        
+                        Console.WriteLine($"Found Q&A pair: Q='{message.Content}', A='{answer}'");
+                        qaPairs.Add((message.Content, answer));
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Skipping non-question bot message: '{message.Content}'");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"Skipping user message: '{message.Content}'");
+                }
+            }
+
+            Console.WriteLine($"Total Q&A pairs extracted: {qaPairs.Count}");
+
+            foreach (var (question, answer) in qaPairs)
+            {
+                evaluationPrompt += $"Q: {question}\nA: {answer}\n\n";
+            }
+
+            if (qaPairs.Count == 0)
+            {
+                evaluationPrompt += "No questions were answered in this interview.\n\n";
             }
 
             evaluationPrompt += "Provide:\n1. Score out of 100 (Score: XX)\n2. Detailed feedback";
+
+            Console.WriteLine($"Sending evaluation prompt to AI: {evaluationPrompt}");
 
             var evaluation = await _gemini.AskQuestionAsync(evaluationPrompt);
 
@@ -221,30 +298,34 @@ public class ChatHub : Hub
                 int.TryParse(scoreMatch.Groups[1].Value, out score);
             }
 
+            Console.WriteLine($"Parsed score: {score}");
+
             // Create and save result
             var result = new InterviewResult
             {
-                SessionId = session.Id,
+                SessionId = dbSession.Id,
                 Score = score,
                 Evaluation = evaluation,
                 CreatedAt = DateTime.UtcNow
             };
 
-            foreach (var pair in qaPairs)
+            foreach (var (question, answer) in qaPairs)
             {
                 result.Questions.Add(new InterviewQuestion
                 {
-                    Question = pair.Question,
-                    Answer = pair.Answer
+                    Question = question,
+                    Answer = answer
                 });
             }
 
             _db.InterviewResults.Add(result);
             await _db.SaveChangesAsync();
 
-            // Notify client
+            Console.WriteLine($"Saved result with {result.Questions.Count} questions");
+
+            // Notify client and redirect directly to results
             await Clients.Caller.SendAsync("InterviewCompleted", score, evaluation);
-            await Clients.Caller.SendAsync("RedirectToResults", session.Id);
+            await Clients.Caller.SendAsync("RedirectToResults", dbSession.Id);
         }
         catch (Exception ex)
         {
@@ -313,16 +394,60 @@ public class ChatHub : Hub
         var question = tracker.AvailableQuestions[index];
         tracker.MarkQuestionAsked(question);
 
-        await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer", $"Question {session.CurrentQuestionNumber}/10: {question}");
+        var formattedQuestion = $"Question {session.CurrentQuestionNumber}/10: {question}";
+        await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer", formattedQuestion);
 
         session.Messages.Add(new ChatMessage
         {
-            Content = question,
+            Content = formattedQuestion,
             IsUserMessage = false,
             SessionId = session.Id,
             Timestamp = DateTime.UtcNow
         });
 
         await _db.SaveChangesAsync();
+    }
+
+    public async Task ResumeInterview(int sessionId)
+    {
+        try
+        {
+            // Check if there's already an active session
+            if (_sessions.ContainsKey(Context.ConnectionId))
+            {
+                await Clients.Caller.SendAsync("ReceiveMessage", "System", "Interview already in progress");
+                return;
+            }
+
+            // Get the session from database
+            var session = await _db.InterviewSessions
+                .Include(s => s.SubTopic)
+                .FirstOrDefaultAsync(s => s.Id == sessionId);
+
+            if (session == null)
+            {
+                await Clients.Caller.SendAsync("ReceiveMessage", "System", "Session not found");
+                return;
+            }
+
+            // Check if session is already completed
+            if (session.IsCompleted)
+            {
+                await Clients.Caller.SendAsync("ReceiveMessage", "System", "This interview is already completed");
+                return;
+            }
+
+            // Add session to active sessions
+            _sessions.TryAdd(Context.ConnectionId, session);
+            await InitializeQuestionTracker(session);
+
+            await Clients.Caller.SendAsync("ReceiveMessage", "Interviewer", 
+                $"Welcome back! Let's continue your interview on {session.SubTopic.Title}. Where were we?");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error resuming interview: {ex}");
+            await Clients.Caller.SendAsync("ReceiveMessage", "System", "Failed to resume interview. Please try again.");
+        }
     }
 }

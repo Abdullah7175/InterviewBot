@@ -14,7 +14,11 @@ namespace InterviewBot.Pages.Topics
 
         public IndexModel(AppDbContext db) => _db = db;
 
-        public void OnGet() => Topics = _db.Topics.Include(t => t.SubTopics).ToList();
+        public void OnGet()
+        {
+            var userId = int.Parse(User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)!.Value);
+            Topics = _db.Topics.Include(t => t.SubTopics).Where(t => t.UserId == userId).ToList();
+        }
 
         public async Task<IActionResult> OnPostDeleteAsync(int id)
         {
